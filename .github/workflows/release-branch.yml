@@ -1,0 +1,70 @@
+name: Create Release Branch
+
+# Run on main.  Creates the release branch for the version main holds (0.9.0
+# gives 0.9.x), then opens a pull request that bumps main to the next minor
+# or major version.  See CONTRIBUTING.md.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Next version on main'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+        - minor
+        - major
+
+permissions:
+  contents: read
+
+jobs:
+  create-branch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+    - name: Harden Runner
+      uses: step-security/harden-runner@v2
+      with:
+        egress-policy: audit
+
+    - name: Checkout the project
+      uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        version: "latest"
+        enable-cache: false
+
+    # An existing branch means an earlier run got that far: carry on.
+    - name: Create the release branch
+      id: branch
+      run: |
+        if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+          echo "Run this workflow on main, not $GITHUB_REF_NAME"
+          exit 1
+        fi
+        version=$(.github/scripts/version.sh get)
+        if [[ "$version" != *.0 ]]; then
+          echo "main holds $version; expected a version that ends in .0"
+          exit 1
+        fi
+        branch="${version%.*}.x"
+        if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+          echo "Branch $branch already exists."
+        else
+          git push origin "HEAD:refs/heads/$branch"
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Open the pull request that bumps main
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BUMP: ${{ inputs.bump }}
+        VERSION: ${{ steps.branch.outputs.version }}
+      run: .github/scripts/version.sh pr main "$BUMP" "$VERSION"

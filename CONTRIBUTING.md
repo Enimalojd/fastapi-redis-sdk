@@ -172,3 +172,74 @@ docs/
 
 Configuration is in `mkdocs.yml` at the repository root.
 
+## Releasing
+
+The version lives in `pyproject.toml`, `uv.lock` and
+`src/redis_fastapi/__init__.py`, and branches hold the version they will release
+next:
+
+- `main` holds the next minor or major version, for example `0.9.0`.
+- A release branch `X.Y.x`, for example `0.9.x`, holds the next patch release.
+
+Releases come only from release branches. Workflows execute the release, and
+change a branch's version through a pull request, avoiding direct push.
+
+### Create a release branch
+
+Run **Actions → Create Release Branch** on `main`, and choose whether `main`
+moves to the next `minor` or `major` version. The workflow:
+
+1. creates `0.9.x` from `main`, which holds `0.9.0`;
+2. opens a pull request that bumps `main` to `0.10.0` (or `1.0.0`).
+
+Merge that pull request soon, so `main` and the new branch don't show the
+same version for long.
+
+### Release
+
+Publish a release on the GitHub **Releases** page:
+
+- **Tag:** a new tag named after the version the branch holds, for example
+  `0.9.1`. The tag has no `v` prefix.
+- **Target:** the release branch, for example `0.9.x`.
+- **Notes:** write them, or use **Generate release notes**. For a patch, choose
+  the previous patch on the same branch as the previous tag.
+- **Set as the latest release:** clear this box for a patch of an older
+  series.
+
+GitHub creates the tag, and publishing starts **Release to PyPI**, which:
+
+1. checks that the tag matches the version the tagged commit holds, and that
+   the commit is on the target branch;
+2. runs the security scan and the tests;
+3. publishes the packages to PyPI and attaches them to the release;
+4. opens a pull request that bumps the branch to the next patch, for
+   example `0.9.2`.
+
+Merge the bump pull request before the next release from that branch.
+Until then, the branch still holds the released version.
+
+If the check fails, nothing reaches PyPI, but the release and its tag exist.
+Delete both, fix the cause, and publish again:
+
+```bash
+gh release delete 0.9.1 --cleanup-tag --yes
+```
+
+To try a release, run **Actions → Release to PyPI** by hand on the release
+branch. It publishes to TestPyPI, or only builds if you choose a dry run. It
+never tags, attaches packages or opens a pull request.
+
+### Patch releases
+
+Merge a fix into `main` first, then backport it to the release branch with a
+pull request, and publish the release from that branch. Never backport the
+bump commits from `main`.
+
+### If a run fails
+
+Re-run the failed jobs. A re-run is safe: it skips files already on PyPI,
+replaces packages already attached to the release, and updates a bump pull
+request already open. Re-running the bump job also rebuilds its pull request from
+the latest branch, which resolves conflicts in `uv.lock`.
+
