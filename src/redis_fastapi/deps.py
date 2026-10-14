@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Annotated, TypeAlias
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from inspect import isawaitable
+from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, cast
 
 if TYPE_CHECKING:
     from redis_fastapi.cache_backend import CacheBackend, SyncCacheBackend
@@ -21,6 +24,24 @@ from redis.asyncio.sentinel import Sentinel as AsyncSentinel
 from redis.asyncio.sentinel import SentinelConnectionPool as AsyncSentinelPool
 
 from redis_fastapi.config import get_settings
+
+# Imported at runtime, not under TYPE_CHECKING, and that is load-bearing.
+# FastAPI resolves an endpoint's annotations with ``get_type_hints``, which
+# evaluates the forward reference inside ``Annotated[...]`` against *this*
+# module's namespace.  A name that exists only for the type checker raises
+# NameError there, and FastAPI then treats the parameter as an ordinary query
+# parameter - so the endpoint answers 422 instead of receiving its session.
+# Under ``from __future__ import annotations`` in the caller's module this is
+# the only spelling that works.  There is no import cycle: session_backend
+# never imports deps at module level.
+from redis_fastapi.session_backend import (
+    RedisSessionStore,
+    SessionState,
+    SessionStore,
+    SyncSessionStore,
+    _StoreCapabilities,
+)
+from redis_fastapi.sessions import Session, session_of, session_state_of
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +70,10 @@ class _PoolState:
     # forward ref (annotations are lazy here), so this needs no runtime import
     # and there is no import cycle: ratelimit_backend never imports deps.
     ratelimit_capabilities: _BackendCapabilities | None = None
+
+    # The same idea for the session store: HSETEX support is a property of the
+    # server, so it is discovered once per pool rather than on every request.
+    session_capabilities: _StoreCapabilities | None = None
 
     # -- pool / cluster builders (static) -----------------------------------
 
@@ -128,6 +153,7 @@ class _PoolState:
         """Reset cached clients (called during lifespan shutdown)."""
         self._async_client = None
         self.ratelimit_capabilities = None
+        self.session_capabilities = None
 
 
 def _get_pool_state(app: FastAPI) -> _PoolState:
@@ -207,6 +233,96 @@ async def get_sync_rate_limit_backend(request: Request) -> SyncRateLimitBackend:
     return SyncRateLimitBackend(backend)
 
 
+async def get_session_store(request: Request) -> SessionStore:
+    """Return the session store for this request.
+
+    Three things can decide what comes back, in order:
+
+    1. ``app.dependency_overrides[get_session_store]``, consulted here rather
+       than only by FastAPI.  The middleware calls this function directly - it
+       runs before dependency resolution - so without this check an override
+       reached handlers and not the load path, and the two halves of a request
+       used different stores.  That gap is why the test suite used to reach
+       into ``app.user_middleware`` and rewrite a private kwarg.
+    2. A ``store`` or ``store_factory`` passed to ``add_redis_sessions``.
+    3. Otherwise a :class:`RedisSessionStore` built from the options given to
+       ``add_redis_sessions`` - coder, encryptor, id_factory, key_prefix and
+       the two clocks.
+
+    Built per request in case 3, but its server-capability cache lives on the
+    pool state, so ``HSETEX`` detection is paid once per process rather than
+    re-probed on every request.
+    """
+    override = request.app.dependency_overrides.get(get_session_store)
+    if override is not None:
+        result = override(request)
+        return cast("SessionStore", await result if isawaitable(result) else result)
+
+    options: _SessionStoreOptions | None = getattr(
+        request.app.state, "_redis_session_options", None
+    )
+    if options is not None:
+        if options.store is not None:
+            return options.store
+        if options.store_factory is not None:
+            built = options.store_factory(request)
+            return cast("SessionStore", await built if isawaitable(built) else built)
+
+    state = _get_pool_state(request.app)
+    if state.session_capabilities is None:
+        state.session_capabilities = _StoreCapabilities()
+    client = await get_async_redis(request)
+    return RedisSessionStore(
+        client,
+        capabilities=state.session_capabilities,
+        **(options.kwargs if options is not None else {}),
+    )
+
+
+@dataclass
+class _SessionStoreOptions:
+    """How ``add_redis_sessions`` was asked to build or supply the store.
+
+    Stashed on ``app.state`` at setup time and read here, so every seam the
+    store constructor offers is reachable from the supported entry point
+    rather than only by replacing the dependency wholesale.
+    """
+
+    store: SessionStore | None = None
+    store_factory: Callable[[Request], Any] | None = None
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+async def get_sync_session_store(request: Request) -> SyncSessionStore:
+    """Return a :class:`SyncSessionStore` for use in sync endpoints.
+
+    The underlying async store is resolved on the event loop; the returned
+    wrapper bridges each call back via :func:`anyio.from_thread.run`.
+    """
+    store = await get_session_store(request)
+    return SyncSessionStore(store)
+
+
+async def get_session_state(request: Request) -> SessionState:
+    """Return the session handle the middleware built for this request.
+
+    Performs no I/O.  Pair it with ``SessionStoreDep`` to rotate or revoke::
+
+        async def logout(state: SessionStateDep, store: SessionStoreDep):
+            await store.revoke(state)
+    """
+    return session_state_of(request)
+
+
+async def get_session(request: Request) -> Session:
+    """Return the session the middleware already loaded for this request.
+
+    Performs no I/O.  The read happened before the application ran, because
+    ``request.session`` is a synchronous property and cannot await.
+    """
+    return session_of(request)
+
+
 AsyncRedisDep = Annotated[AsyncClient, Depends(get_async_redis)]
 CacheBackendDep = Annotated["CacheBackend", Depends(get_cache_backend)]
 SyncCacheBackendDep = Annotated["SyncCacheBackend", Depends(get_sync_cache_backend)]
@@ -214,3 +330,7 @@ RateLimitBackendDep = Annotated["RateLimitBackend", Depends(get_rate_limit_backe
 SyncRateLimitBackendDep = Annotated[
     "SyncRateLimitBackend", Depends(get_sync_rate_limit_backend)
 ]
+SessionStoreDep = Annotated[SessionStore, Depends(get_session_store)]
+SyncSessionStoreDep = Annotated[SyncSessionStore, Depends(get_sync_session_store)]
+SessionDep = Annotated[Session, Depends(get_session)]
+SessionStateDep = Annotated[SessionState, Depends(get_session_state)]
