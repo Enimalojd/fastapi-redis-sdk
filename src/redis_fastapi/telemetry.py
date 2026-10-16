@@ -330,7 +330,7 @@ def timed_rate_limit(scope: str = "") -> Generator[None, None, None]:
 def session_span(
     name: str,
     attributes: dict[str, Any] | None = None,
-) -> Iterator[Any]:
+) -> Generator[Any, None, None]:
     """Create a span for a session operation.  No-op when OTel is disabled."""
     if not _state.enabled or _state.tracer is None:
         yield None
@@ -382,7 +382,7 @@ def record_session_latency(*, duration: float, operation: str) -> None:
 
 
 @contextlib.contextmanager
-def timed_session(operation: str) -> Iterator[None]:
+def timed_session(operation: str) -> Generator[None, None, None]:
     """Context manager that records latency for a session operation."""
     start = time.monotonic()
     try:
